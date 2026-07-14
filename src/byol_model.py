@@ -182,13 +182,18 @@ from src.ca_paper_plsr import (
     _umx_two_peak_ratio_features, _umx_build_tables,
     _umx_continuous_summary, _umx_save_payload, _umx_plot_holdout_pred,
 )
-from src.utils import spectra_normalization
+from src.utils import (
+    DEFAULT_RANDOM_SEED,
+    set_random_seed,
+    spectra_normalization,
+)
 
 # ===========================================================================
 # Config
 # ===========================================================================
 
 BYOL_CONFIG = {
+    "random_seed": DEFAULT_RANDOM_SEED,
     # Encoder
     "in_channels": 1,
     "base_channels": 128,
@@ -258,7 +263,8 @@ def _mixture_color_map():
     }
 
 
-def _umx_group_folds(group_table, n_splits=3, random_state=2026):
+def _umx_group_folds(group_table, n_splits=3,
+                     random_state=DEFAULT_RANDOM_SEED):
     """Local stratified group-fold assignment for BYOL legacy routines."""
     rng = np.random.default_rng(random_state)
     group_table = group_table.copy()
@@ -767,7 +773,8 @@ def _variance_loss(z, gamma=0.04, eps=1e-4):
 
 def _load_byol_data(data_dir, conc_threshold=None,
                     mix_only=False, present_conc_range=None,
-                    singleton_sample_folds=False):
+                    singleton_sample_folds=False,
+                    random_state=UNMIX_RANDOM_STATE):
     """Load and preprocess all spectra for byol pre-training.
 
     byol doesn't need labels, so we only return spectra.
@@ -802,7 +809,7 @@ def _load_byol_data(data_dir, conc_threshold=None,
     group_table = (pd.DataFrame(table_data)
                    .drop_duplicates("group_id").reset_index(drop=True))
     folds = _umx_group_folds(group_table, n_splits=UNMIX_N_OUTER,
-                              random_state=UNMIX_RANDOM_STATE)
+                              random_state=random_state)
     fold_lookup = dict(zip(folds["group_id"], folds["fold"]))
     df_all = pd.DataFrame(table_data)
     df_all["outer_fold"] = df_all["group_id"].map(fold_lookup).astype(int)
@@ -811,7 +818,7 @@ def _load_byol_data(data_dir, conc_threshold=None,
         mix_group_counts = group_table.groupby("mixture")["group_id"].nunique()
         singleton_mixes = mix_group_counts[mix_group_counts == 1].index.tolist()
         if singleton_mixes:
-            rng = np.random.default_rng(UNMIX_RANDOM_STATE)
+            rng = np.random.default_rng(random_state)
             print("  Classification fold fallback for singleton groups: "
                   f"{singleton_mixes}")
             for mix in singleton_mixes:
@@ -944,7 +951,9 @@ def _stage1_byol_pretrain(RawIntensity, config, model_dir, device,
 
         X_clean_np = X_clean.cpu().numpy()
         X_scaled = StandardScaler().fit_transform(X_clean_np)
-        pca = PCA(n_components=pca_distill_components, random_state=0)
+        pca = PCA(
+            n_components=pca_distill_components,
+            random_state=int(cfg["random_seed"]))
         pca_scores = pca.fit_transform(X_scaled).astype(np.float32)
         pca_scores = (
             pca_scores - pca_scores.mean(axis=0, keepdims=True)
@@ -1684,7 +1693,8 @@ def _stage2_finetune_8class(RawIntensity, df_all, encoder_path, config,
     return all_preds, all_probs, y_all
 
 
-def _plot_raw_pca_pc12_grid(X_norm, df_all, ensemble_cfg):
+def _plot_raw_pca_pc12_grid(X_norm, df_all, ensemble_cfg,
+                            random_state=UNMIX_RANDOM_STATE):
     """Plot PC1-PC2 scatter for each raw-PCA ensemble member."""
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
@@ -1717,7 +1727,8 @@ def _plot_raw_pca_pc12_grid(X_norm, df_all, ensemble_cfg):
     for idx, (ax, (n_comp, c_val)) in enumerate(zip(axes, ensemble_cfg)):
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_norm)
-        pca = PCA(n_components=max(2, int(n_comp)), random_state=0)
+        pca = PCA(n_components=max(2, int(n_comp)),
+                  random_state=random_state)
         scores = pca.fit_transform(X_scaled)
         ax.scatter(scores[:, 0], scores[:, 1], c=point_colors,
                    s=14, linewidths=0)
@@ -1776,6 +1787,7 @@ def _stage2_raw_pca_8class(RawIntensity, df_all, config, model_dir,
         bad = sorted(set(df_all["mixture"]) - set(BYOL_8CLASS_LABELS))
         raise ValueError(f"Unknown mixture labels for 8-class task: {bad}")
     y_all = mapped.to_numpy(dtype=np.int64)
+    random_state = int(config["random_seed"])
 
     X = np.asarray(RawIntensity, dtype=np.float32)
     X_norm = (X - X.min(axis=1, keepdims=True)) / (
@@ -1807,11 +1819,13 @@ def _stage2_raw_pca_8class(RawIntensity, df_all, config, model_dir,
         for n_comp, c_val in ensemble_cfg:
             clf = Pipeline([
                 ("scaler", StandardScaler()),
-                ("pca", PCA(n_components=n_comp, random_state=0)),
+                ("pca", PCA(n_components=n_comp,
+                            random_state=random_state)),
                 ("clf", LogisticRegression(
                     max_iter=4000,
                     class_weight="balanced",
                     C=c_val,
+                    random_state=random_state,
                 )),
             ])
             clf.fit(X_norm[train_mask], y_all[train_mask])
@@ -1864,7 +1878,8 @@ def _stage2_raw_pca_8class(RawIntensity, df_all, config, model_dir,
 
     _ensure_byol_output_dirs()
     if plot:
-        _plot_raw_pca_pc12_grid(X_norm, df_all, ensemble_cfg)
+        _plot_raw_pca_pc12_grid(
+            X_norm, df_all, ensemble_cfg, random_state=random_state)
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
         cm_s8 = confusion_matrix(true_mix, pred_mix, labels=BYOL_8CLASS_LABELS)
@@ -1989,6 +2004,7 @@ def _stage2_byol_embedding_logreg_8class(RawIntensity, df_all, encoder_path,
     from sklearn.preprocessing import StandardScaler
 
     cfg = config
+    random_state = int(cfg["random_seed"])
     label_to_idx = {m: i for i, m in enumerate(BYOL_8CLASS_LABELS)}
     idx_to_label = {i: m for m, i in label_to_idx.items()}
     mapped = df_all["mixture"].map(label_to_idx)
@@ -2053,12 +2069,13 @@ def _stage2_byol_embedding_logreg_8class(RawIntensity, df_all, encoder_path,
             steps = [("scaler", StandardScaler())]
             if n_comp is not None:
                 steps.append(("pca", PCA(n_components=n_comp,
-                                         random_state=0)))
+                                         random_state=random_state)))
             steps.append(
                 ("clf", LogisticRegression(
                     max_iter=4000,
                     class_weight="balanced",
                     C=c_val,
+                    random_state=random_state,
                 ))
             )
             clf = Pipeline(steps)
@@ -2231,7 +2248,8 @@ def _stage2_plsr_quant(RawIntensity, Concentrations, df_all, encoder_path,
         train_gids = group_ids[fmask]
         train_meta = df_all.loc[fmask].drop_duplicates("group_id").reset_index(drop=True)
         inner_folds = _umx_group_folds(train_meta, n_splits=2,
-                                        random_state=UNMIX_RANDOM_STATE + fold)
+                                        random_state=(
+                                            int(cfg["random_seed"]) + fold))
         ilookup = dict(zip(inner_folds["group_id"], inner_folds["fold"]))
         isample = np.array([ilookup[g] for g in train_gids])
 
@@ -2463,7 +2481,7 @@ def _ca_full_byol_embeddings(raw_intensity, encoder_path, cfg, device):
 
 
 def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
-                              train_mask, n_components=5):
+                              group_ids, train_mask, n_components=5):
     """Fit true-class calibration models used after BYOL class prediction."""
     from sklearn.linear_model import LinearRegression
     from sklearn.cross_decomposition import PLSRegression
@@ -2489,7 +2507,7 @@ def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
                 "model_type": "linear_1480_1388_over_920",
                 "target": UNMIX_ANALYTES[target_j],
                 "selected_n_components": np.nan,
-                "n_train": int(mix_mask.sum()),
+                "n_train_groups": int(np.unique(group_ids[mix_mask]).size),
             })
             continue
 
@@ -2509,7 +2527,7 @@ def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
             "model_type": "multi_output_plsr_by_predicted_class",
             "target": "+".join(UNMIX_ANALYTES[j] for j in present),
             "selected_n_components": n_comp,
-            "n_train": int(mix_mask.sum()),
+            "n_train_groups": int(np.unique(group_ids[mix_mask]).size),
         })
     return models, pd.DataFrame(rows)
 
@@ -2546,6 +2564,7 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     cfg = BYOL_CONFIG.copy()
     if config:
         cfg.update(config)
+    random_state = set_random_seed(cfg["random_seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_model_dir = _ca_full_writable_model_dir(model_dir)
@@ -2588,7 +2607,7 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
 
     print("\n[2/7] Building balanced holdout split ...")
     train_mask, val_mask = _umx_balanced_holdout_split(
-        group_ids, val_fraction=0.30, random_state=UNMIX_RANDOM_STATE)
+        group_ids, val_fraction=0.30, random_state=random_state)
     print(f"  Train spectra: {train_mask.sum()}")
     print(f"  Validation spectra: {val_mask.sum()}")
 
@@ -2627,9 +2646,11 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     for n_comp, c_val in ensemble_cfg:
         steps = [("scaler", StandardScaler())]
         if n_comp is not None:
-            steps.append(("pca", PCA(n_components=n_comp, random_state=0)))
+            steps.append(("pca", PCA(
+                n_components=n_comp, random_state=random_state)))
         steps.append(("clf", LogisticRegression(
-            max_iter=4000, class_weight="balanced", C=c_val)))
+            max_iter=4000, class_weight="balanced", C=c_val,
+            random_state=random_state)))
         clf = Pipeline(steps)
         clf.fit(z[train_mask], y_cls[train_mask])
         val_prob += clf.predict_proba(z[val_mask]).astype(np.float32)
@@ -2642,8 +2663,6 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     val_pred_idx = val_prob.argmax(axis=1)
     val_pred_mix = np.array([idx_to_label[i] for i in val_pred_idx])
     val_true_mix = mixtures[val_mask]
-    acc_s = accuracy_score(val_true_mix, val_pred_mix)
-
     df_val = df_all.loc[val_mask].copy().reset_index(drop=True)
     df_val["split"] = "validation"
     df_val["true_mixture"] = val_true_mix
@@ -2655,13 +2674,17 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     grp_pred_mix = np.array([
         idx_to_label[i] for i in grp_prob.to_numpy().argmax(axis=1)])
     grp_true_mix = df_val.groupby("group_id")["mixture"].first().to_numpy()
+    group_cls = grp_prob.reset_index()
+    group_cls.insert(1, "level", "group")
+    group_cls.insert(2, "true_mixture", grp_true_mix)
+    group_cls.insert(3, "pred_mixture", grp_pred_mix)
+    group_cls.insert(4, "correct", grp_true_mix == grp_pred_mix)
     grp_pred_lookup = dict(zip(grp_prob.index.to_numpy(), grp_pred_mix))
     val_route_mix = np.array([
         grp_pred_lookup[gid] for gid in df_val["group_id"].to_numpy()
     ])
     acc_g = accuracy_score(grp_true_mix, grp_pred_mix)
-    print(f"  Validation spectra accuracy: {acc_s:.4f}")
-    print(f"  Validation group accuracy:   {acc_g:.4f}")
+    print(f"  Validation group accuracy: {acc_g:.4f}")
 
     print("\n[5/7] Training true-class PLSR calibration models ...")
     x_spectrum = spectra_normalization(
@@ -2670,7 +2693,8 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
         plot=False, mode="ca_paper_full_pipeline", minmax_scale=False)
     x_ratio = _umx_two_peak_ratio_features(raman_shift, intensity)
     quant_models, model_table = _ca_full_fit_quant_models(
-        x_spectrum, x_ratio, conc, mixtures, train_mask, n_components=5)
+        x_spectrum, x_ratio, conc, mixtures, group_ids, train_mask,
+        n_components=5)
     print(model_table.to_string(index=False))
 
     print("\n[6/7] Predicting validation concentrations by predicted class ...")
@@ -2716,7 +2740,7 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     sample_conc.to_csv(sample_path, index=False, encoding="utf-8-sig")
     group_conc.to_csv(group_path, index=False, encoding="utf-8-sig")
     summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
-    df_val.to_csv(cls_path, index=False, encoding="utf-8-sig")
+    group_cls.to_csv(cls_path, index=False, encoding="utf-8-sig")
     print(f"  Exported {sample_path}")
     print(f"  Exported {group_path}")
     print(f"  Exported {summary_path}")
@@ -2747,9 +2771,11 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
 
     payload = {
         "method": "CA_Paper_Full_Pipeline",
+        "random_seed": random_state,
         "class_labels": labels,
-        "classifier_accuracy_spectra": acc_s,
         "classifier_accuracy_group": acc_g,
+        "metric_level": "group",
+        "group_classification": group_cls,
         "classifier_models": classifier_models,
         "encoder_path": encoder_path,
         "quant_models": quant_models,
@@ -2795,6 +2821,7 @@ def BYOLFullPipeline(data_dir, model_dir, conc_threshold=None,
     cfg = BYOL_CONFIG.copy()
     if config:
         cfg.update(config)
+    random_state = set_random_seed(cfg["random_seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -2804,7 +2831,8 @@ def BYOLFullPipeline(data_dir, model_dir, conc_threshold=None,
     Raman_Shift, RawIntensity, Y_cls, Concentrations, Mixtures, df_all = \
         _load_byol_data(
             data_dir, conc_threshold, mix_only, present_conc_range,
-            singleton_sample_folds=(stage2_task == "classification"))
+            singleton_sample_folds=(stage2_task == "classification"),
+            random_state=random_state)
 
     # --- Determine norm mode from task ---
     norm_mode = "minmax" if stage2_task == "classification" else "peak"
@@ -2853,5 +2881,3 @@ def BYOLFullPipeline(data_dir, model_dir, conc_threshold=None,
     print("\n" + "=" * 60)
     print("BYOL Full Pipeline completed.")
     print("=" * 60)
-
-

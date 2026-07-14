@@ -5,13 +5,12 @@ import pandas as pd
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.base import clone
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import explained_variance_score, mean_squared_error, r2_score
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.svm import SVR
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+
+from src.utils import DEFAULT_RANDOM_SEED, set_random_seed
 
 UNMIX_ANALYTES = ["DA", "E", "NE"]
 UNMIX_MODEL_MIXTURES = ["DA", "E", "NE", "DA+E", "DA+NE", "E+NE", "DA+E+NE"]
@@ -141,7 +140,7 @@ def _umx_two_peak_ratio_features(raman_shift, intensity):
 
 
 def _umx_balanced_holdout_split(group_ids, val_fraction=0.30,
-                                random_state=2026):
+                                random_state=DEFAULT_RANDOM_SEED):
     """Sample-level holdout split inside every concentration group. Author: Xuanting Liu."""
     rng = np.random.default_rng(random_state)
     train_mask = np.zeros(len(group_ids), dtype=bool)
@@ -202,7 +201,7 @@ def _umx_build_tables(df_model, pred):
 
 
 def _umx_continuous_summary(result_df, level_name):
-    """Compute original MAE/RMSE/bias/R2 summary. Author: Xuanting Liu."""
+    """Compute metrics from one row per group, including zero targets."""
     true_cols = [f"conc_{a}" for a in UNMIX_ANALYTES]
     pred_cols = [f"pred_conc_{a}" for a in UNMIX_ANALYTES]
     yt = result_df[true_cols].to_numpy(dtype=float)
@@ -213,15 +212,13 @@ def _umx_continuous_summary(result_df, level_name):
         "n": len(result_df),
         "global_MAE": np.mean(np.abs(yp - yt)),
         "global_RMSE": _umx_rmse(yt.reshape(-1), yp.reshape(-1)),
+        "global_R2": _umx_safe_r2(yt.reshape(-1), yp.reshape(-1)),
     }
     for j, analyte in enumerate(UNMIX_ANALYTES):
         row[f"{analyte}_MAE"] = np.mean(np.abs(yp[:, j] - yt[:, j]))
         row[f"{analyte}_RMSE"] = _umx_rmse(yt[:, j], yp[:, j])
         row[f"{analyte}_bias"] = np.mean(yp[:, j] - yt[:, j])
-        present = yt[:, j] > 0
-        row[f"{analyte}_R2"] = (
-            _umx_safe_r2(yt[present, j], yp[present, j])
-            if present.sum() > 1 else np.nan)
+        row[f"{analyte}_R2"] = _umx_safe_r2(yt[:, j], yp[:, j])
     return pd.DataFrame([row])
 
 
@@ -332,8 +329,9 @@ def _predict_cnn_unmixing(model, x):
     return pred.cpu().numpy()
 
 
-def _fit_predict_unmixing_method(method, x_spectrum, x_ratio, y_conc,
-                                 mixtures, train_mask, val_mask):
+def _fit_predict_unmixing_method(method, x_spectrum, y_conc,
+                                 mixtures, group_ids, train_mask, val_mask,
+                                 random_state=DEFAULT_RANDOM_SEED):
     """Fit and predict one original per-mixture unmixing method. Author: Xuanting Liu."""
     pred_val = np.zeros((int(val_mask.sum()), len(UNMIX_ANALYTES)), dtype=float)
     pred_train = np.zeros((int(train_mask.sum()), len(UNMIX_ANALYTES)), dtype=float)
@@ -353,59 +351,37 @@ def _fit_predict_unmixing_method(method, x_spectrum, x_ratio, y_conc,
         absent = [j for j in range(len(UNMIX_ANALYTES)) if j not in present]
 
         if method == "plsr":
-            if mix in UNMIX_SINGLE_MIXTURES:
-                target_j = present[0]
-                model = LinearRegression()
-                model.fit(x_ratio[tr], y_conc[tr, target_j])
-                pred_val[val_rows, target_j] = model.predict(x_ratio[va])
-                pred_train[train_rows, target_j] = model.predict(x_ratio[tr])
-                final = LinearRegression().fit(
-                    x_ratio[mix_mask], y_conc[mix_mask, target_j])
-                model_type = "linear_1480_1388_over_920"
-                selected = np.nan
-                final_models[mix] = {
-                    "model_type": model_type,
-                    "target": UNMIX_ANALYTES[target_j],
-                    "model": final,
-                }
-            else:
-                n_comp = min(5, x_spectrum[tr].shape[0] - 1,
-                             x_spectrum[tr].shape[1])
-                n_comp = max(1, int(n_comp))
-                model = PLSRegression(n_components=n_comp, scale=True)
-                model.fit(x_spectrum[tr], y_conc[tr][:, present])
-                val_local = model.predict(x_spectrum[va])
-                train_local = model.predict(x_spectrum[tr])
-                for local_j, target_j in enumerate(present):
-                    pred_val[val_rows, target_j] = val_local[:, local_j]
-                    pred_train[train_rows, target_j] = train_local[:, local_j]
-                final = PLSRegression(n_components=n_comp, scale=True)
-                final.fit(x_spectrum[mix_mask], y_conc[mix_mask][:, present])
-                model_type = "multi_output_plsr_holdout"
-                selected = n_comp
-                final_models[mix] = {
-                    "model_type": model_type,
-                    "targets": [UNMIX_ANALYTES[j] for j in present],
-                    "model": final,
-                    "n_components": n_comp,
-                }
+            n_comp = min(5, x_spectrum[tr].shape[0] - 1,
+                         x_spectrum[tr].shape[1])
+            n_comp = max(1, int(n_comp))
+            model = PLSRegression(n_components=n_comp, scale=True)
+            model.fit(x_spectrum[tr], y_conc[tr][:, present])
+            val_local = model.predict(x_spectrum[va])
+            train_local = model.predict(x_spectrum[tr])
+            for local_j, target_j in enumerate(present):
+                pred_val[val_rows, target_j] = val_local[:, local_j]
+                pred_train[train_rows, target_j] = train_local[:, local_j]
+            final = PLSRegression(n_components=n_comp, scale=True)
+            final.fit(x_spectrum[mix_mask], y_conc[mix_mask][:, present])
+            model_type = "multi_output_plsr_holdout"
+            selected = n_comp
+            final_models[mix] = {
+                "model_type": model_type,
+                "targets": [UNMIX_ANALYTES[j] for j in present],
+                "model": final,
+                "n_components": n_comp,
+            }
         else:
-            use_ratio = (mix in UNMIX_SINGLE_MIXTURES and method != "cnn")
-            x_tr = x_ratio[tr] if use_ratio else x_spectrum[tr]
-            x_va = x_ratio[va] if use_ratio else x_spectrum[va]
-            x_all = x_ratio[mix_mask] if use_ratio else x_spectrum[mix_mask]
+            x_tr = x_spectrum[tr]
+            x_va = x_spectrum[va]
+            x_all = x_spectrum[mix_mask]
             y_tr = y_conc[tr][:, present]
             y_all = y_conc[mix_mask][:, present]
             if method == "rf":
                 model = RandomForestRegressor(
                     n_estimators=100, max_depth=15, min_samples_split=5,
-                    random_state=42, n_jobs=1)
+                    random_state=random_state, n_jobs=1)
                 model_type = "random_forest_unmixing"
-                selected = np.nan
-            elif method == "svr":
-                model = MultiOutputRegressor(
-                    SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.1))
-                model_type = "svr_unmixing"
                 selected = np.nan
             elif method == "cnn":
                 model = _fit_cnn_unmixing(x_tr, y_tr, len(present))
@@ -451,8 +427,8 @@ def _fit_predict_unmixing_method(method, x_spectrum, x_ratio, y_conc,
             "model_type": model_type,
             "target": "+".join(UNMIX_ANALYTES[j] for j in present),
             "selected_n_components": selected,
-            "n_train": int(tr.sum()),
-            "n_validation": int(va.sum()),
+            "n_train_groups": int(np.unique(group_ids[tr]).size),
+            "n_validation_groups": int(np.unique(group_ids[va]).size),
         })
 
     return (
@@ -464,46 +440,48 @@ def _fit_predict_unmixing_method(method, x_spectrum, x_ratio, y_conc,
 
 
 def _radar_metrics_from_groups(train_group, val_group):
-    """Build Origin radar metrics from original group-level outputs. Author: Xuanting Liu."""
+    """Build radar metrics from all group rows, including zero targets."""
     rows = {}
     for analyte in UNMIX_ANALYTES:
         y_tr = train_group[f"conc_{analyte}"].to_numpy(float)
         p_tr = train_group[f"pred_conc_{analyte}"].to_numpy(float)
         y_te = val_group[f"conc_{analyte}"].to_numpy(float)
         p_te = val_group[f"pred_conc_{analyte}"].to_numpy(float)
-        present_tr = y_tr > 0
-        present_te = y_te > 0
-        rmse = float(np.sqrt(mean_squared_error(y_te[present_te], p_te[present_te])))
-        y_range = float(np.max(y_te[present_te]) - np.min(y_te[present_te]))
+        rmse = float(np.sqrt(mean_squared_error(y_te, p_te)))
+        y_range = float(np.max(y_te) - np.min(y_te))
         rows[f"{analyte}_1-normalized RMSE"] = 1.0 - rmse / y_range if y_range > 0 else np.nan
         rows[f"{analyte}_R2Train"] = (
-            float(r2_score(y_tr[present_tr], p_tr[present_tr]))
-            if present_tr.sum() > 1 else np.nan)
+            float(r2_score(y_tr, p_tr))
+            if len(np.unique(y_tr)) > 1 else np.nan)
         rows[f"{analyte}_R2Test"] = (
-            float(r2_score(y_te[present_te], p_te[present_te]))
-            if present_te.sum() > 1 else np.nan)
+            float(r2_score(y_te, p_te))
+            if len(np.unique(y_te)) > 1 else np.nan)
         rows[f"{analyte}_RPD"] = (
-            float(np.std(y_te[present_te], ddof=1) / rmse)
-            if rmse > 0 and present_te.sum() > 1 else np.nan)
+            float(np.std(y_te, ddof=1) / rmse)
+            if rmse > 0 and len(y_te) > 1 else np.nan)
         rows[f"{analyte}_Explained Variance"] = (
-            float(explained_variance_score(y_te[present_te], p_te[present_te]))
-            if present_te.sum() > 1 else np.nan)
+            float(explained_variance_score(y_te, p_te))
+            if len(y_te) > 1 else np.nan)
     return rows
 
 
 def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
-                             random_state=2026, plot=True,
-                             mix_only=False, present_conc_range=(10, 20)):
-    """Compare PLSR/RF/SVR/CNN for component concentration unmixing. Author: Xuanting Liu."""
+                             random_state=DEFAULT_RANDOM_SEED, plot=True,
+                             mix_only=True, present_conc_range=(10, 20)):
+    """Compare PLSR/RF/CNN on mixture component concentrations. Author: Xuanting Liu."""
     if methods is None:
-        methods = ["plsr", "rf", "svr", "cnn"]
+        methods = ["plsr", "rf", "cnn"]
     methods = [m.lower() for m in methods]
+    unsupported = set(methods) - {"plsr", "rf", "cnn"}
+    if unsupported:
+        raise ValueError(f"Unsupported unmixing methods: {sorted(unsupported)}")
+    set_random_seed(random_state)
     os.makedirs("visualizations", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     print("=" * 60)
-    print("CA Paper Unmixing Models - PLSR/RF/SVR/CNN")
+    print("CA Paper Unmixing Models - PLSR/RF/CNN (mixtures only)")
     print("=" * 60)
 
     raman_shift, intensity, concentrations, groups, mixtures = \
@@ -521,7 +499,6 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
 
     x_spectrum = _spectra_normalization(
         raman_shift, intensity, peak_position=920, peak_range=20)
-    x_ratio = _umx_two_peak_ratio_features(raman_shift, intensity)
     y_conc = concentrations.copy()
     group_ids = np.array([
         _umx_make_group_id(mixtures[i], y_conc[i, 0], y_conc[i, 1], y_conc[i, 2])
@@ -543,6 +520,7 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
     all_summary, all_model_tables, radar_by_method = [], [], {}
     payload = {
         "method": "ca_paper_unmixing_models",
+        "random_seed": random_state,
         "methods": methods,
         "train_mask": train_mask,
         "validation_mask": val_mask,
@@ -554,8 +532,8 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
         print(f"\n--- {method.upper()} unmixing ---")
         pred_val, pred_train, model_table, final_models = \
             _fit_predict_unmixing_method(
-                method, x_spectrum, x_ratio, y_conc, mixtures,
-                train_mask, val_mask)
+                method, x_spectrum, y_conc, mixtures, group_ids,
+                train_mask, val_mask, random_state=random_state)
         df_val = df_model.loc[val_mask].copy().reset_index(drop=True)
         df_val["split"] = "validation"
         df_val["model_mixture"] = df_val["mixture"]
@@ -615,8 +593,11 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
     summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
     model_table_df.to_csv(model_table_path, index=False, encoding="utf-8-sig")
 
-    radar_df = pd.DataFrame({"Metric": list(next(iter(radar_by_method.values())).keys())})
-    for method in ["PLSR", "RF", "SVR", "CNN"]:
+    radar_df = pd.DataFrame({
+        "Metric": list(next(iter(radar_by_method.values())).keys()),
+        "Level": "group",
+    })
+    for method in ["PLSR", "RF", "CNN"]:
         if method in radar_by_method:
             radar_df[method] = radar_df["Metric"].map(radar_by_method[method])
     radar_path = "reports/CA_Paper_Unmixing_Models_Radar.csv"
@@ -629,6 +610,7 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
     payload["summary"] = summary_df
     payload["model_table"] = model_table_df
     payload["radar"] = radar_df
+    payload["metric_level"] = "group"
     model_path = os.path.join(model_dir, "ca_paper_unmixing_models.joblib")
     joblib.dump(payload, model_path)
     print(f"Saved {model_path}")

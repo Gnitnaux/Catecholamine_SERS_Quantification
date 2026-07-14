@@ -8,6 +8,7 @@ from sklearn.linear_model import LinearRegression
 
 from src.utils import (
     ANALYTES,
+    DEFAULT_RANDOM_SEED,
     MODEL_MIXTURES,
     SINGLE_MIXTURES,
     balanced_holdout_split,
@@ -19,6 +20,7 @@ from src.utils import (
     plot_pred_vs_true,
     read_mix_spectra,
     regression_summary,
+    set_random_seed,
 )
 
 
@@ -125,8 +127,11 @@ def _prepare_unmixing_data(data_dir, mix_only=False, present_conc_range=None):
     return raman_shift, x_spectrum, x_ratio, conc, groups, mixtures, group_ids, df
 
 
-def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False, present_conc_range=None):
+def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False,
+                           present_conc_range=None,
+                           random_state=DEFAULT_RANDOM_SEED):
     """Plain holdout PLSR unmixing. Author: Xuanting Liu."""
+    set_random_seed(random_state)
     print("=" * 60)
     print("CA Paper PLSR Unmixing - plain holdout validation")
     print("=" * 60)
@@ -136,7 +141,8 @@ def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False, prese
 
     raman_shift, x_spectrum, x_ratio, y_conc, groups, mixtures, group_ids, df = _prepare_unmixing_data(
         data_dir, mix_only=mix_only, present_conc_range=present_conc_range)
-    train_mask, val_mask = balanced_holdout_split(group_ids, val_fraction=0.30, random_state=2026)
+    train_mask, val_mask = balanced_holdout_split(
+        group_ids, val_fraction=0.30, random_state=random_state)
     print(f"  Spectra: {len(mixtures)}, groups: {df['group_id'].nunique()}")
     print(f"  Train spectra: {train_mask.sum()}, validation spectra: {val_mask.sum()}")
 
@@ -167,6 +173,7 @@ def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False, prese
 
     payload = {
         "method": "plain_holdout_plsr_unmixing",
+        "random_seed": random_state,
         "models": models,
         "model_table": model_table,
         "summary": summary_df,
@@ -185,7 +192,7 @@ UNMIX_ANALYTES = ANALYTES
 UNMIX_MODEL_MIXTURES = MODEL_MIXTURES
 UNMIX_SINGLE_MIXTURES = SINGLE_MIXTURES
 UNMIX_N_OUTER = 3
-UNMIX_RANDOM_STATE = 2026
+UNMIX_RANDOM_STATE = DEFAULT_RANDOM_SEED
 
 
 def _read_mpau_mix_spectra(data_dir):
@@ -221,7 +228,7 @@ def _umx_two_peak_ratio_features(Raman_Shift, Intensity):
 
 
 def _umx_balanced_holdout_split(group_ids, val_fraction=0.30,
-                                random_state=2026):
+                                random_state=DEFAULT_RANDOM_SEED):
     """Legacy balanced holdout split wrapper. Author: Xuanting Liu."""
     return balanced_holdout_split(
         group_ids, val_fraction=val_fraction, random_state=random_state)
@@ -295,7 +302,7 @@ def _umx_build_tables(df_model, pred, Y_conc=None, response_mode="concentration"
 
 
 def _umx_continuous_summary(result_df, response_mode, level_name):
-    """Compute legacy concentration or ratio summary. Author: Xuanting Liu."""
+    """Compute metrics from one row per group, including zero targets."""
     if response_mode == "concentration":
         true_cols = [f"conc_{a}" for a in UNMIX_ANALYTES]
         pred_cols = [f"pred_conc_{a}" for a in UNMIX_ANALYTES]
@@ -310,15 +317,17 @@ def _umx_continuous_summary(result_df, response_mode, level_name):
         "n": len(result_df),
         "global_MAE": np.mean(np.abs(yp - yt)),
         "global_RMSE": np.sqrt(mean_squared_error(yt.reshape(-1), yp.reshape(-1))),
+        "global_R2": (
+            r2_score(yt.reshape(-1), yp.reshape(-1))
+            if len(np.unique(yt)) > 1 else np.nan),
     }
     for j, analyte in enumerate(UNMIX_ANALYTES):
         row[f"{analyte}_MAE"] = np.mean(np.abs(yp[:, j] - yt[:, j]))
         row[f"{analyte}_RMSE"] = np.sqrt(mean_squared_error(yt[:, j], yp[:, j]))
         row[f"{analyte}_bias"] = np.mean(yp[:, j] - yt[:, j])
-        present = yt[:, j] > 0
         row[f"{analyte}_R2"] = (
-            r2_score(yt[present, j], yp[present, j])
-            if present.sum() > 1 else np.nan)
+            r2_score(yt[:, j], yp[:, j])
+            if len(np.unique(yt[:, j])) > 1 else np.nan)
     return pd.DataFrame([row])
 
 

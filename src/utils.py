@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import numpy as np
 import pandas as pd
@@ -9,6 +10,27 @@ ANALYTES = ["DA", "E", "NE"]
 MODEL_MIXTURES = ["DA", "E", "NE", "DA+E", "DA+NE", "E+NE", "DA+E+NE"]
 SINGLE_MIXTURES = ["DA", "E", "NE"]
 CLASS_LABELS = ["BA"] + MODEL_MIXTURES
+DEFAULT_RANDOM_SEED = 2026
+
+
+def set_random_seed(seed=DEFAULT_RANDOM_SEED):
+    """Fix Python, NumPy and PyTorch RNGs for reproducible model runs."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    return seed
 
 
 def parse_mix_folder(folder):
@@ -115,7 +137,8 @@ def make_group_id(mixture, conc):
     return f"{mixture}|{da:g}|{e:g}|{ne:g}"
 
 
-def balanced_holdout_split(group_ids, val_fraction=0.30, random_state=2026):
+def balanced_holdout_split(
+        group_ids, val_fraction=0.30, random_state=DEFAULT_RANDOM_SEED):
     """Sample validation spectra inside every concentration group. Author: Xuanting Liu."""
     rng = np.random.default_rng(random_state)
     train = np.zeros(len(group_ids), dtype=bool)
@@ -131,7 +154,8 @@ def balanced_holdout_split(group_ids, val_fraction=0.30, random_state=2026):
     return train, val
 
 
-def group_folds(group_ids, mixtures, n_splits=3, random_state=2026):
+def group_folds(group_ids, mixtures, n_splits=3,
+                random_state=DEFAULT_RANDOM_SEED):
     """Assign stratified folds by mixture labels. Author: Xuanting Liu."""
     rng = np.random.default_rng(random_state)
     table = pd.DataFrame({"group_id": group_ids, "mixture": mixtures}).drop_duplicates()

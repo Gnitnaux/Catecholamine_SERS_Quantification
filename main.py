@@ -10,6 +10,7 @@ from pathlib import Path
 from src.ca_paper_regression import CA_Paper_Unmixing_Models
 from src.ca_paper_plsr import CA_Paper_PLSR_Unmixing
 from src.byol_model import BYOLFullPipeline, CA_Paper_Full_Pipeline
+from src.utils import DEFAULT_RANDOM_SEED
 
 # Add src directory to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -67,13 +68,13 @@ def main():
     
     if args.mode == "ca_paper_unmixing_models":
         print("\nCA Paper Unmixing Models mode selected.")
-        print("PLSR/RF/SVR/CNN component unmixing on selected data.")
+        print("PLSR/RF/CNN component unmixing on mixture data only.")
         data_dir = os.path.join('data', args.data_dir)
         CA_Paper_Unmixing_Models(
             data_dir, args.model_dir,
-            methods=['plsr', 'rf', 'svr', 'cnn'],
-            random_state=2026, plot=True,
-            mix_only=False, present_conc_range=(10, 20))
+            methods=['plsr', 'rf', 'cnn'],
+            random_state=DEFAULT_RANDOM_SEED, plot=True,
+            mix_only=True, present_conc_range=(10, 20))
         print("CA Paper Unmixing Models completed.")
 
     elif args.mode == "ca_paper_plsr_unmixing":
