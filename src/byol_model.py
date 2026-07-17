@@ -20,14 +20,22 @@ import csv
 import math
 import os
 import time
+import warnings
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
 
-# Fix root causes of known warnings
-torch.backends.cuda.enable_nested_tensor = False
-torch.backends.cuda.enable_flash_sdp = False
+# Use the deterministic math implementation of scaled-dot-product attention.
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Torch was not compiled with flash attention.*",
+    category=UserWarning,
+    module=r"torch\.nn\.functional",
+)
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -54,7 +62,6 @@ class ChannelAttention(nn.Module):
     def __init__(self, channels, reduction=8):
         super().__init__()
         self.gap = nn.AdaptiveAvgPool1d(1)
-        self.gmp = nn.AdaptiveMaxPool1d(1)
         hidden = max(channels // reduction, 8)
         self.mlp = nn.Sequential(
             nn.Linear(channels, hidden),
@@ -66,7 +73,10 @@ class ChannelAttention(nn.Module):
     def forward(self, x):
         # x: (B, C, L)
         y_avg = self.gap(x).squeeze(-1)   # (B, C)
-        y_max = self.gmp(x).squeeze(-1)   # (B, C)
+        # AdaptiveMaxPool1d backward is non-deterministic on CUDA. The output
+        # size here is always 1, so amax is the equivalent deterministic
+        # global maximum reduction and keeps existing checkpoints compatible.
+        y_max = torch.amax(x, dim=-1)     # (B, C)
         att = self.sigmoid(self.mlp(y_avg) + self.mlp(y_max))  # (B, C)
         return x * att.unsqueeze(-1)
 
@@ -311,7 +321,8 @@ class BYOLEncoder(nn.Module):
             activation="gelu", batch_first=True, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers)
+            encoder_layer, num_layers=num_layers,
+            enable_nested_tensor=False)
         self.fusion = nn.Sequential(
             nn.Linear(out_dim * 2, out_dim),
             nn.GELU(),
