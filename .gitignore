@@ -1,11 +1,12 @@
 # Data files
+/data/*
+!/data/.gitkeep
 visualizations/*
 !visualizations/.gitkeep
 reports/*
 !reports/.gitkeep
 logs/*
 !logs/.gitkeep
-!data/.gitkeep
 
 # Model files
 models/*
