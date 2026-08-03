@@ -189,7 +189,7 @@ from src.ca_paper_plsr import (
     UNMIX_ANALYTES, UNMIX_N_OUTER, UNMIX_RANDOM_STATE,
     UNMIX_MODEL_MIXTURES, UNMIX_SINGLE_MIXTURES,
     _umx_balanced_holdout_split, _umx_present_analyte_indices,
-    _umx_two_peak_ratio_features, _umx_build_tables,
+    _umx_1480_normalized_intensity, _umx_build_tables,
     _umx_continuous_summary, _umx_save_payload, _umx_plot_holdout_pred,
 )
 from src.utils import (
@@ -204,6 +204,10 @@ from src.utils import (
 
 BYOL_CONFIG = {
     "random_seed": DEFAULT_RANDOM_SEED,
+    # Full-pipeline stress-test split.  Seed 3 leaves one concentration group
+    # misclassified with the current MPAU encoder, so routing errors remain
+    # visible instead of being hidden by a perfect group-level result.
+    "full_pipeline_split_seed": 3,
     # Encoder
     "in_channels": 1,
     "base_channels": 128,
@@ -2465,6 +2469,22 @@ def _ca_full_writable_model_dir(model_dir):
         return "model_output"
 
 
+def _ca_full_stratified_group_holdout(group_ids, mixtures, random_state,
+                                      n_splits=3, validation_fold=0):
+    """Hold out complete concentration groups, stratified by mixture class."""
+    group_table = pd.DataFrame({
+        "group_id": group_ids,
+        "mixture": mixtures,
+    }).drop_duplicates("group_id").reset_index(drop=True)
+    folded = _umx_group_folds(
+        group_table, n_splits=n_splits, random_state=random_state)
+    fold_lookup = dict(zip(folded["group_id"], folded["fold"]))
+    sample_folds = np.array([fold_lookup[gid] for gid in group_ids])
+    val_mask = sample_folds == int(validation_fold)
+    train_mask = ~val_mask
+    return train_mask, val_mask
+
+
 def _ca_full_byol_embeddings(raw_intensity, encoder_path, cfg, device):
     """Extract frozen BYOL encoder embeddings using classifier min-max input."""
     x_all_t = torch.from_numpy(np.asarray(raw_intensity, dtype=np.float32))
@@ -2491,7 +2511,7 @@ def _ca_full_byol_embeddings(raw_intensity, encoder_path, cfg, device):
     return np.concatenate(feats, axis=0).astype(np.float32)
 
 
-def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
+def _ca_full_fit_quant_models(x_spectrum, x_1480, y_conc, mixtures,
                               group_ids, train_mask, n_components=5):
     """Fit true-class calibration models used after BYOL class prediction."""
     from sklearn.linear_model import LinearRegression
@@ -2507,15 +2527,15 @@ def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
         if mix in UNMIX_SINGLE_MIXTURES:
             target_j = present[0]
             model = LinearRegression().fit(
-                x_ratio[mix_mask], y_conc[mix_mask, target_j])
+                x_1480[mix_mask], y_conc[mix_mask, target_j])
             models[mix] = {
-                "model_type": "linear_1480_1388_over_920",
+                "model_type": "linear_1480_over_920",
                 "target_indices": present,
                 "model": model,
             }
             rows.append({
                 "model_mixture": mix,
-                "model_type": "linear_1480_1388_over_920",
+                "model_type": "linear_1480_over_920",
                 "target": UNMIX_ANALYTES[target_j],
                 "selected_n_components": np.nan,
                 "n_train_groups": int(np.unique(group_ids[mix_mask]).size),
@@ -2543,7 +2563,7 @@ def _ca_full_fit_quant_models(x_spectrum, x_ratio, y_conc, mixtures,
     return models, pd.DataFrame(rows)
 
 
-def _ca_full_predict_by_class(models, pred_mix, x_spectrum, x_ratio):
+def _ca_full_predict_by_class(models, pred_mix, x_spectrum, x_1480):
     pred = np.zeros((len(pred_mix), len(UNMIX_ANALYTES)), dtype=float)
     for mix in UNMIX_MODEL_MIXTURES:
         idx = np.where(pred_mix == mix)[0]
@@ -2551,9 +2571,9 @@ def _ca_full_predict_by_class(models, pred_mix, x_spectrum, x_ratio):
             continue
         spec = models[mix]
         present = spec["target_indices"]
-        if spec["model_type"] == "linear_1480_1388_over_920":
+        if spec["model_type"] == "linear_1480_over_920":
             target_j = present[0]
-            pred[idx, target_j] = spec["model"].predict(x_ratio[idx])
+            pred[idx, target_j] = spec["model"].predict(x_1480[idx])
         else:
             local_pred = spec["model"].predict(x_spectrum[idx])
             for local_j, target_j in enumerate(present):
@@ -2575,7 +2595,9 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     cfg = BYOL_CONFIG.copy()
     if config:
         cfg.update(config)
-    random_state = set_random_seed(cfg["random_seed"])
+    encoder_random_state = set_random_seed(cfg["random_seed"])
+    random_state = int(cfg.get(
+        "full_pipeline_split_seed", encoder_random_state))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_model_dir = _ca_full_writable_model_dir(model_dir)
@@ -2585,6 +2607,8 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     print("CA Paper Full Pipeline - BYOL classifier + class-routed PLSR")
     print("=" * 60)
     print(f"Device: {device}")
+    print(f"Encoder random seed: {encoder_random_state}")
+    print(f"Full-pipeline split seed: {random_state}")
 
     print("\n[1/7] Reading and filtering spectra ...")
     raman_shift, intensity, conc, groups, mixtures = _read_mpau_mix_spectra(
@@ -2616,28 +2640,47 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     print(f"  Spectra: {len(mixtures)}, groups: "
           f"{df_all['group_id'].nunique()}")
 
-    print("\n[2/7] Building balanced holdout split ...")
-    train_mask, val_mask = _umx_balanced_holdout_split(
-        group_ids, val_fraction=0.30, random_state=random_state)
+    print("\n[2/7] Building stratified whole-group holdout split ...")
+    train_mask, val_mask = _ca_full_stratified_group_holdout(
+        group_ids, mixtures, random_state=random_state,
+        n_splits=3, validation_fold=0)
     print(f"  Train spectra: {train_mask.sum()}")
     print(f"  Validation spectra: {val_mask.sum()}")
+    print(f"  Train groups: {np.unique(group_ids[train_mask]).size}")
+    print(f"  Validation groups: {np.unique(group_ids[val_mask]).size}")
+    overlap = np.intersect1d(
+        np.unique(group_ids[train_mask]), np.unique(group_ids[val_mask]))
+    if len(overlap):
+        raise RuntimeError(
+            f"Group leakage detected in full-pipeline split: {overlap[:3]}")
 
     print("\n[3/7] Training/loading BYOL encoder on training spectra ...")
     norm_mode = "minmax"
     fp_dataset = f"{dataset}_full_pipeline"
     encoder_path = os.path.join(
         run_model_dir, f"byol_stage1_{fp_dataset}_{norm_mode}.pt")
-    if stage1:
+    if re_training:
+        if not stage1:
+            raise ValueError(
+                "re_training=True requires stage1=True in the full pipeline")
         _, encoder_path = _stage1_byol_pretrain(
             intensity[train_mask], cfg, run_model_dir, device,
             norm_mode=norm_mode, dataset=fp_dataset,
-            re_training=re_training, plot=plot, raman_shift=raman_shift)
-    elif not os.path.exists(encoder_path):
+            re_training=True, plot=plot, raman_shift=raman_shift)
+    elif os.path.exists(encoder_path):
+        print(f"  re_training=False: loading encoder from {encoder_path}")
+    else:
         raise FileNotFoundError(
-            f"No full-pipeline BYOL encoder found at {encoder_path}")
+            f"re_training=False but no full-pipeline BYOL encoder found at "
+            f"{encoder_path}")
 
     print("\n[4/7] Training BYOL embedding classifier ...")
-    z = _ca_full_byol_embeddings(intensity, encoder_path, cfg, device)
+    # Extract the two splits separately.  The classifier is fitted only with
+    # z_train, and only z_val is passed to validation prediction.
+    z_train = _ca_full_byol_embeddings(
+        intensity[train_mask], encoder_path, cfg, device)
+    z_val = _ca_full_byol_embeddings(
+        intensity[val_mask], encoder_path, cfg, device)
     labels = list(UNMIX_MODEL_MIXTURES)
     label_to_idx = {m: i for i, m in enumerate(labels)}
     idx_to_label = {i: m for m, i in label_to_idx.items()}
@@ -2663,8 +2706,8 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
             max_iter=4000, class_weight="balanced", C=c_val,
             random_state=random_state)))
         clf = Pipeline(steps)
-        clf.fit(z[train_mask], y_cls[train_mask])
-        val_prob += clf.predict_proba(z[val_mask]).astype(np.float32)
+        clf.fit(z_train, y_cls[train_mask])
+        val_prob += clf.predict_proba(z_val).astype(np.float32)
         classifier_models.append({
             "embedding_pca_components": n_comp,
             "C": c_val,
@@ -2698,19 +2741,29 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     print(f"  Validation group accuracy: {acc_g:.4f}")
 
     print("\n[5/7] Training true-class PLSR calibration models ...")
-    x_spectrum = spectra_normalization(
-        raman_shift, intensity,
+    x_spectrum_train = spectra_normalization(
+        raman_shift, intensity[train_mask],
         peak_position=920, peak_range=20,
-        plot=False, mode="ca_paper_full_pipeline", minmax_scale=False)
-    x_ratio = _umx_two_peak_ratio_features(raman_shift, intensity)
+        plot=False, mode="ca_paper_full_pipeline_train", minmax_scale=False)
+    x_1480_train = _umx_1480_normalized_intensity(
+        raman_shift, intensity[train_mask])
+    train_only_mask = np.ones(int(train_mask.sum()), dtype=bool)
     quant_models, model_table = _ca_full_fit_quant_models(
-        x_spectrum, x_ratio, conc, mixtures, group_ids, train_mask,
+        x_spectrum_train, x_1480_train, conc[train_mask],
+        mixtures[train_mask], group_ids[train_mask], train_only_mask,
         n_components=5)
     print(model_table.to_string(index=False))
 
     print("\n[6/7] Predicting validation concentrations by predicted class ...")
+    x_spectrum_val = spectra_normalization(
+        raman_shift, intensity[val_mask],
+        peak_position=920, peak_range=20,
+        plot=False, mode="ca_paper_full_pipeline_validation",
+        minmax_scale=False)
+    x_1480_val = _umx_1480_normalized_intensity(
+        raman_shift, intensity[val_mask])
     pred_val = _ca_full_predict_by_class(
-        quant_models, val_route_mix, x_spectrum[val_mask], x_ratio[val_mask])
+        quant_models, val_route_mix, x_spectrum_val, x_1480_val)
     df_eval = df_all.loc[val_mask].copy().reset_index(drop=True)
     df_eval["split"] = "validation"
     df_eval["model_mixture"] = val_route_mix
@@ -2783,6 +2836,7 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
     payload = {
         "method": "CA_Paper_Full_Pipeline",
         "random_seed": random_state,
+        "encoder_random_seed": encoder_random_state,
         "class_labels": labels,
         "classifier_accuracy_group": acc_g,
         "metric_level": "group",

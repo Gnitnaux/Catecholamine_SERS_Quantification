@@ -24,16 +24,20 @@ from src.utils import (
 )
 
 
-def _fit_single_ratio(x_ratio, y_conc, mixture):
-    """Fit a single-component linear ratio calibration. Author: Xuanting Liu."""
+def _fit_single_1480(x_1480, y_conc, mixture):
+    """Fit single-component calibration from normalized 1480 intensity."""
     target = ANALYTES.index(mixture)
-    model = LinearRegression().fit(x_ratio, y_conc[:, target])
-    return {"model": model, "target": target, "model_type": "linear_peak_ratio"}
+    model = LinearRegression().fit(x_1480, y_conc[:, target])
+    return {
+        "model": model,
+        "target": target,
+        "model_type": "linear_1480_over_920",
+    }
 
 
-def _predict_single_ratio(info, x_ratio, out):
+def _predict_single_1480(info, x_1480, out):
     """Predict one single-component concentration column. Author: Xuanting Liu."""
-    out[:, info["target"]] = info["model"].predict(x_ratio)
+    out[:, info["target"]] = info["model"].predict(x_1480)
     return out
 
 
@@ -62,7 +66,7 @@ def _predict_plsr_subset(info, x_spectrum, out):
     return out
 
 
-def fit_class_routed_plsr(x_spectrum, x_ratio, y_conc, mixtures, train_mask, n_components=5):
+def fit_class_routed_plsr(x_spectrum, x_1480, y_conc, mixtures, train_mask, n_components=5):
     """Fit per-class calibration models used by unmixing pipelines. Author: Xuanting Liu."""
     models, rows = {}, []
     for mix in MODEL_MIXTURES:
@@ -70,7 +74,7 @@ def fit_class_routed_plsr(x_spectrum, x_ratio, y_conc, mixtures, train_mask, n_c
         if mask.sum() < 2:
             continue
         if mix in SINGLE_MIXTURES:
-            info = _fit_single_ratio(x_ratio[mask], y_conc[mask], mix)
+            info = _fit_single_1480(x_1480[mask], y_conc[mask], mix)
             target = mix
             n_comp = np.nan
         else:
@@ -88,7 +92,7 @@ def fit_class_routed_plsr(x_spectrum, x_ratio, y_conc, mixtures, train_mask, n_c
     return models, pd.DataFrame(rows)
 
 
-def predict_by_mixture(models, pred_mixtures, x_spectrum, x_ratio):
+def predict_by_mixture(models, pred_mixtures, x_spectrum, x_1480):
     """Route spectra to per-class calibration models. Author: Xuanting Liu."""
     pred = np.zeros((len(pred_mixtures), len(ANALYTES)), dtype=float)
     for mix in np.unique(pred_mixtures):
@@ -97,7 +101,7 @@ def predict_by_mixture(models, pred_mixtures, x_spectrum, x_ratio):
         if info is None:
             continue
         if mix in SINGLE_MIXTURES:
-            pred[rows] = _predict_single_ratio(info, x_ratio[rows], pred[rows])
+            pred[rows] = _predict_single_1480(info, x_1480[rows], pred[rows])
         else:
             pred[rows] = _predict_plsr_subset(info, x_spectrum[rows], pred[rows])
     return np.maximum(pred, 0.0)
@@ -115,7 +119,7 @@ def _prepare_unmixing_data(data_dir, mix_only=False, present_conc_range=None):
         print(f"  Removing {(~keep).sum()} non-model spectra, e.g. BA.")
     intensity, conc, groups, mixtures = intensity[keep], conc[keep], groups[keep], mixtures[keep]
     x_spectrum = normalize_spectra(raman_shift, intensity, peak_position=920, peak_range=20)
-    x_ratio = peak_ratio_features(raman_shift, intensity)
+    x_1480 = peak_ratio_features(raman_shift, intensity, centers=(1480,))
     group_ids = np.array([make_group_id(m, c) for m, c in zip(mixtures, conc)])
     df = pd.DataFrame({
         "group_id": group_ids,
@@ -124,7 +128,7 @@ def _prepare_unmixing_data(data_dir, mix_only=False, present_conc_range=None):
         "conc_E": conc[:, 1],
         "conc_NE": conc[:, 2],
     })
-    return raman_shift, x_spectrum, x_ratio, conc, groups, mixtures, group_ids, df
+    return raman_shift, x_spectrum, x_1480, conc, groups, mixtures, group_ids, df
 
 
 def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False,
@@ -139,15 +143,15 @@ def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False,
     os.makedirs("reports", exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    raman_shift, x_spectrum, x_ratio, y_conc, groups, mixtures, group_ids, df = _prepare_unmixing_data(
+    raman_shift, x_spectrum, x_1480, y_conc, groups, mixtures, group_ids, df = _prepare_unmixing_data(
         data_dir, mix_only=mix_only, present_conc_range=present_conc_range)
     train_mask, val_mask = balanced_holdout_split(
         group_ids, val_fraction=0.30, random_state=random_state)
     print(f"  Spectra: {len(mixtures)}, groups: {df['group_id'].nunique()}")
     print(f"  Train spectra: {train_mask.sum()}, validation spectra: {val_mask.sum()}")
 
-    models, model_table = fit_class_routed_plsr(x_spectrum, x_ratio, y_conc, mixtures, train_mask)
-    pred_val = predict_by_mixture(models, mixtures[val_mask], x_spectrum[val_mask], x_ratio[val_mask])
+    models, model_table = fit_class_routed_plsr(x_spectrum, x_1480, y_conc, mixtures, train_mask)
+    pred_val = predict_by_mixture(models, mixtures[val_mask], x_spectrum[val_mask], x_1480[val_mask])
     df_val = df.loc[val_mask].copy()
     df_val["split"] = "validation"
     df_val["model_mixture"] = df_val["mixture"]
@@ -219,11 +223,11 @@ def _umx_present_analyte_indices(mixture):
     return [UNMIX_ANALYTES.index(a) for a in mixture.split("+")]
 
 
-def _umx_two_peak_ratio_features(Raman_Shift, Intensity):
-    """Build 1480/920 and 1388/920 ratio features. Author: Xuanting Liu."""
+def _umx_1480_normalized_intensity(Raman_Shift, Intensity):
+    """Build the normalized 1480 intensity used by single-component models."""
     return peak_ratio_features(
         Raman_Shift, Intensity,
-        centers=(1480, 1388), denominator=920, peak_range=20,
+        centers=(1480,), denominator=920, peak_range=20,
     )
 
 
