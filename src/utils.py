@@ -138,19 +138,49 @@ def make_group_id(mixture, conc):
 
 
 def balanced_holdout_split(
-        group_ids, val_fraction=0.30, random_state=DEFAULT_RANDOM_SEED):
-    """Sample validation spectra inside every concentration group. Author: Xuanting Liu."""
+        group_ids, val_fraction=0.30, random_state=DEFAULT_RANDOM_SEED,
+        mixtures=None):
+    """Stratified holdout of complete concentration groups.
+
+    Replicate spectra sharing a group id are never split between training and
+    validation.  Stratification uses the supplied mixture labels, or the
+    mixture prefix embedded in ``group_id`` when labels are omitted.
+    """
     rng = np.random.default_rng(random_state)
-    train = np.zeros(len(group_ids), dtype=bool)
-    val = np.zeros(len(group_ids), dtype=bool)
-    for gid in np.unique(group_ids):
-        idx = np.where(group_ids == gid)[0]
-        idx = rng.permutation(idx)
-        n_val = max(1, int(round(len(idx) * val_fraction)))
-        if n_val >= len(idx) and len(idx) > 1:
-            n_val = len(idx) - 1
-        val[idx[:n_val]] = True
-        train[idx[n_val:]] = True
+    group_ids = np.asarray(group_ids)
+    if mixtures is None:
+        mixtures = np.array([str(gid).split("|", 1)[0]
+                             for gid in group_ids])
+    else:
+        mixtures = np.asarray(mixtures)
+    if len(group_ids) != len(mixtures):
+        raise ValueError("group_ids and mixtures must have the same length")
+
+    table = pd.DataFrame({
+        "group_id": group_ids,
+        "mixture": mixtures,
+    }).drop_duplicates("group_id")
+    train_groups, val_groups = [], []
+    for mixture in sorted(table["mixture"].unique()):
+        gids = table.loc[
+            table["mixture"] == mixture, "group_id"].to_numpy()
+        gids = rng.permutation(gids)
+        if len(gids) == 1:
+            # A singleton class cannot support both sides of a holdout.
+            # Keep it in training; callers needing evaluation must collect
+            # another independent group for this class.
+            train_groups.extend(gids.tolist())
+            continue
+        n_val = int(round(len(gids) * val_fraction))
+        n_val = min(max(1, n_val), len(gids) - 1)
+        val_groups.extend(gids[:n_val].tolist())
+        train_groups.extend(gids[n_val:].tolist())
+
+    train = np.isin(group_ids, train_groups)
+    val = np.isin(group_ids, val_groups)
+    overlap = np.intersect1d(group_ids[train], group_ids[val])
+    if len(overlap):
+        raise RuntimeError(f"Group leakage in holdout split: {overlap[:3]}")
     return train, val
 
 

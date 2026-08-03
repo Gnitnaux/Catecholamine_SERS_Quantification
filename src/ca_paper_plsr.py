@@ -146,7 +146,8 @@ def CA_Paper_PLSR_Unmixing(data_dir, model_dir, plot=True, mix_only=False,
     raman_shift, x_spectrum, x_1480, y_conc, groups, mixtures, group_ids, df = _prepare_unmixing_data(
         data_dir, mix_only=mix_only, present_conc_range=present_conc_range)
     train_mask, val_mask = balanced_holdout_split(
-        group_ids, val_fraction=0.30, random_state=random_state)
+        group_ids, val_fraction=0.30, random_state=random_state,
+        mixtures=mixtures)
     print(f"  Spectra: {len(mixtures)}, groups: {df['group_id'].nunique()}")
     print(f"  Train spectra: {train_mask.sum()}, validation spectra: {val_mask.sum()}")
 
@@ -232,10 +233,12 @@ def _umx_1480_normalized_intensity(Raman_Shift, Intensity):
 
 
 def _umx_balanced_holdout_split(group_ids, val_fraction=0.30,
-                                random_state=DEFAULT_RANDOM_SEED):
+                                random_state=DEFAULT_RANDOM_SEED,
+                                mixtures=None):
     """Legacy balanced holdout split wrapper. Author: Xuanting Liu."""
     return balanced_holdout_split(
-        group_ids, val_fraction=val_fraction, random_state=random_state)
+        group_ids, val_fraction=val_fraction, random_state=random_state,
+        mixtures=mixtures)
 
 
 def _umx_make_ratio_targets(y_conc):

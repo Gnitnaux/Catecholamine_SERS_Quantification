@@ -833,14 +833,9 @@ def _load_byol_data(data_dir, conc_threshold=None,
         mix_group_counts = group_table.groupby("mixture")["group_id"].nunique()
         singleton_mixes = mix_group_counts[mix_group_counts == 1].index.tolist()
         if singleton_mixes:
-            rng = np.random.default_rng(random_state)
-            print("  Classification fold fallback for singleton groups: "
-                  f"{singleton_mixes}")
-            for mix in singleton_mixes:
-                idx = df_all.index[df_all["mixture"] == mix].to_numpy()
-                idx = rng.permutation(idx)
-                for k, row_idx in enumerate(idx):
-                    df_all.loc[row_idx, "outer_fold"] = k % UNMIX_N_OUTER
+            print("  Singleton mixture groups remain intact (no sample-level "
+                  f"fallback): {singleton_mixes}. Their held-out fold has no "
+                  "training example for that class.")
 
     # Binary labels for Stage 2: [DA, E, NE] ∈ {0,1}³
     Y_cls = (Concentrations > 0).astype(np.float32)  # (N, 3)
@@ -1844,7 +1839,14 @@ def _stage2_raw_pca_8class(RawIntensity, df_all, config, model_dir,
                 )),
             ])
             clf.fit(X_norm[train_mask], y_all[train_mask])
-            fold_prob += clf.predict_proba(X_norm[test_mask]).astype(np.float32)
+            local_prob = clf.predict_proba(
+                X_norm[test_mask]).astype(np.float32)
+            # A fully held-out singleton group can leave one class absent
+            # from this fold's training set. Map local probability columns
+            # back to the fixed global class indices without splitting the
+            # singleton group's replicate spectra.
+            for local_col, class_idx in enumerate(clf.classes_):
+                fold_prob[:, int(class_idx)] += local_prob[:, local_col]
             fold_model_list.append({
                 "pca_components": n_comp,
                 "C": c_val,
@@ -2095,7 +2097,10 @@ def _stage2_byol_embedding_logreg_8class(RawIntensity, df_all, encoder_path,
             )
             clf = Pipeline(steps)
             clf.fit(Z[train_mask], y_all[train_mask])
-            fold_prob += clf.predict_proba(Z[test_mask]).astype(np.float32)
+            local_prob = clf.predict_proba(
+                Z[test_mask]).astype(np.float32)
+            for local_col, class_idx in enumerate(clf.classes_):
+                fold_prob[:, int(class_idx)] += local_prob[:, local_col]
             fold_model_list.append({
                 "embedding_pca_components": n_comp,
                 "C": c_val,
@@ -2656,7 +2661,9 @@ def CA_Paper_Full_Pipeline(data_dir, model_dir, conc_threshold=None,
 
     print("\n[3/7] Training/loading BYOL encoder on training spectra ...")
     norm_mode = "minmax"
-    fp_dataset = f"{dataset}_full_pipeline"
+    # Include the group split in the artifact name so re_training=False can
+    # never silently reuse an encoder pretrained with validation groups.
+    fp_dataset = f"{dataset}_full_pipeline_groupsplit_s{random_state}_f0"
     encoder_path = os.path.join(
         run_model_dir, f"byol_stage1_{fp_dataset}_{norm_mode}.pt")
     if re_training:

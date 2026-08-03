@@ -10,7 +10,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.utils import DEFAULT_RANDOM_SEED, set_random_seed
+from src.utils import (
+    DEFAULT_RANDOM_SEED,
+    balanced_holdout_split as shared_group_holdout_split,
+    set_random_seed,
+)
 
 UNMIX_ANALYTES = ["DA", "E", "NE"]
 UNMIX_MODEL_MIXTURES = ["DA", "E", "NE", "DA+E", "DA+NE", "E+NE", "DA+E+NE"]
@@ -140,22 +144,12 @@ def _umx_two_peak_ratio_features(raman_shift, intensity):
 
 
 def _umx_balanced_holdout_split(group_ids, val_fraction=0.30,
-                                random_state=DEFAULT_RANDOM_SEED):
-    """Sample-level holdout split inside every concentration group. Author: Xuanting Liu."""
-    rng = np.random.default_rng(random_state)
-    train_mask = np.zeros(len(group_ids), dtype=bool)
-    val_mask = np.zeros(len(group_ids), dtype=bool)
-    for gid in sorted(np.unique(group_ids)):
-        idx = np.where(group_ids == gid)[0]
-        if len(idx) <= 1:
-            train_mask[idx] = True
-            continue
-        idx = rng.permutation(idx)
-        n_val = int(round(len(idx) * val_fraction))
-        n_val = min(max(1, n_val), len(idx) - 1)
-        val_mask[idx[:n_val]] = True
-        train_mask[idx[n_val:]] = True
-    return train_mask, val_mask
+                                random_state=DEFAULT_RANDOM_SEED,
+                                mixtures=None):
+    """Stratified holdout of complete concentration groups."""
+    return shared_group_holdout_split(
+        group_ids, val_fraction=val_fraction, random_state=random_state,
+        mixtures=mixtures)
 
 
 def _umx_rmse(y_true, y_pred):
@@ -512,7 +506,8 @@ def CA_Paper_Unmixing_Models(data_dir, model_dir, methods=None,
         "conc_NE": y_conc[:, 2],
     })
     train_mask, val_mask = _umx_balanced_holdout_split(
-        group_ids, val_fraction=0.30, random_state=random_state)
+        group_ids, val_fraction=0.30, random_state=random_state,
+        mixtures=mixtures)
     print(f"  Spectra: {len(mixtures)}, groups: {df_model['group_id'].nunique()}")
     print(f"  Train spectra: {train_mask.sum()}")
     print(f"  Validation spectra: {val_mask.sum()}")
